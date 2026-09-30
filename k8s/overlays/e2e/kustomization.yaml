@@ -1,0 +1,9 @@
+# Used only by CI: the dev overlay, but with a locally built image loaded into a kind cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../dev
+images:
+  - name: ghcr.io/sonubepop/k8s-gitops-deploy
+    newName: release-info
+    newTag: e2e-v1

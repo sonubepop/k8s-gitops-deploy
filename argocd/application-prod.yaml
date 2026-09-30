@@ -1,0 +1,18 @@
+# prod is synced manually after a reviewed change to k8s/overlays/prod.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: release-info-prod
+  namespace: argocd
+spec:
+  project: release-info
+  source:
+    repoURL: https://github.com/sonubepop/k8s-gitops-deploy.git
+    targetRevision: main
+    path: k8s/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: release-info-prod
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

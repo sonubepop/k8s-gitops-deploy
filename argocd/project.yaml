@@ -1,0 +1,17 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: release-info
+  namespace: argocd
+spec:
+  description: GitOps-managed release-info service
+  sourceRepos:
+    - https://github.com/sonubepop/k8s-gitops-deploy.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: release-info-dev
+    - server: https://kubernetes.default.svc
+      namespace: release-info-prod
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace

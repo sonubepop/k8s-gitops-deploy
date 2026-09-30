@@ -1,0 +1,151 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/sonubepop/k8s-gitops-deploy
+  KUSTOMIZE_VERSION: 5.4.3
+  KUBECONFORM_VERSION: 0.6.7
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -q
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kustomize and kubeconform
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar xz -C /usr/local/bin
+      - name: Render and validate every overlay
+        run: |
+          for overlay in dev prod e2e; do
+            echo "== $overlay"
+            kustomize build "k8s/overlays/$overlay" | kubeconform -strict -summary -kubernetes-version 1.30.0 -
+          done
+      - name: Validate Argo CD and monitoring CRDs
+        run: |
+          kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            argocd/ monitoring/servicemonitor.yaml
+      - name: Lint shell scripts and Dockerfile
+        run: |
+          shellcheck scripts/*.sh
+          docker run --rm -i hadolint/hadolint < Dockerfile
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, manifests]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # keyless cosign signing via GitHub OIDC
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg APP_VERSION="${{ steps.meta.outputs.tag }}" \
+            --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+            -t "$IMAGE:${{ steps.meta.outputs.tag }}" .
+      - name: Vulnerability scan (fail on fixable CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: sbom.cdx.json
+      - name: Push to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "$IMAGE:${{ steps.meta.outputs.tag }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+          docker push "$IMAGE:latest"
+          echo "DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:${{ steps.meta.outputs.tag }}")" >> "$GITHUB_ENV"
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Sign image and attach SBOM attestation (keyless)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cosign sign --yes "$DIGEST"
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$DIGEST"
+          echo "Signed $DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [test, manifests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kustomize
+        run: curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: e2e
+      - name: Build v1 and v2 images and load them into kind
+        run: |
+          for v in e2e-v1 e2e-v2; do
+            docker build --build-arg APP_VERSION=$v --build-arg GIT_COMMIT="$GITHUB_SHA" -t release-info:$v .
+            kind load docker-image release-info:$v --name e2e
+          done
+      - name: Deploy, check endpoints, zero-downtime rolling update
+        run: ./scripts/e2e-test.sh
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get all -A
+          kubectl -n release-info-dev describe pods
+          kubectl -n release-info-dev logs deploy/release-info --tail=100
+
+  promote-dev:
+    # GitOps: record the new image tag in git; Argo CD syncs the dev environment from it.
+    runs-on: ubuntu-latest
+    needs: [build, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    concurrency: promote-dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump dev image tag
+        run: |
+          TAG="${{ needs.build.outputs.tag }}"
+          sed -i -E "s/^( *newTag: ).*/\1${TAG}/" k8s/overlays/dev/kustomization.yaml
+          git diff
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "deploy(dev): release-info ${TAG} [skip ci]" || { echo "already at ${TAG}"; exit 0; }
+          git pull --rebase origin main
+          git push origin HEAD:main
+          echo "dev overlay now points at ${IMAGE}:${TAG}" >> "$GITHUB_STEP_SUMMARY"

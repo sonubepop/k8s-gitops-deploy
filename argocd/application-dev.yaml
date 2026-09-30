@@ -1,0 +1,27 @@
+# dev follows main automatically: CI bumps the image tag in k8s/overlays/dev, Argo CD syncs it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: release-info-dev
+  namespace: argocd
+spec:
+  project: release-info
+  source:
+    repoURL: https://github.com/sonubepop/k8s-gitops-deploy.git
+    targetRevision: main
+    path: k8s/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: release-info-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 2m

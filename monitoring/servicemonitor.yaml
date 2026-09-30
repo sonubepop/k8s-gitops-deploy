@@ -1,0 +1,16 @@
+# Used with kube-prometheus-stack (helm release name "monitoring"), see scripts/local-up.sh
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: release-info
+  namespace: release-info-dev
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: release-info
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

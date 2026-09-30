@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: release-info-dev
+resources:
+  - ../../base
+  - namespace.yaml
+replicas:
+  - name: release-info
+    count: 1
+configMapGenerator:
+  - name: release-info-config
+    behavior: merge
+    literals:
+      - ENVIRONMENT=dev
+# The CI pipeline updates this tag after every successful build on main (GitOps promotion).
+images:
+  - name: ghcr.io/sonubepop/k8s-gitops-deploy
+    newTag: latest

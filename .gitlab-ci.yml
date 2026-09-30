@@ -1,0 +1,178 @@
+# GitLab CI/CD version of .github/workflows/ci.yml
+# test -> validate manifests -> build image -> scan + SBOM -> sign -> kind e2e -> GitOps promotion to dev
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip ci\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - test
+  - build
+  - security
+  - e2e
+  - promote
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE
+  TAG: $CI_COMMIT_SHORT_SHA
+  KUSTOMIZE_VERSION: "5.4.3"
+  KUBECONFORM_VERSION: "0.6.7"
+
+default:
+  interruptible: true
+
+.docker:
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: /certs
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+.k8s-tools:
+  before_script:
+    - apk add --no-cache bash curl git
+    - curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+    - curl -sSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar xz -C /usr/local/bin
+
+unit-tests:
+  stage: test
+  image: python:3.12-slim
+  cache:
+    key:
+      files:
+        - requirements-dev.txt
+    paths:
+      - .pip-cache/
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.pip-cache
+  script:
+    - pip install -q -r requirements-dev.txt
+    - ruff check .
+    - pytest -q --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+validate-manifests:
+  stage: test
+  image: alpine:3.20
+  extends: .k8s-tools
+  script:
+    - |
+      for overlay in dev prod e2e; do
+        echo "== $overlay"
+        kustomize build "k8s/overlays/$overlay" | kubeconform -strict -summary -kubernetes-version 1.30.0 -
+      done
+    - kubeconform -strict -summary -schema-location default
+        -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+        argocd/ monitoring/servicemonitor.yaml
+
+lint-dockerfile:
+  stage: test
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint Dockerfile
+
+build-image:
+  stage: build
+  extends: .docker
+  script:
+    - docker build --build-arg APP_VERSION="$TAG" --build-arg GIT_COMMIT="$CI_COMMIT_SHA" -t "$IMAGE:$TAG" .
+    - docker push "$IMAGE:$TAG"
+
+container-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:0.56.2
+    entrypoint: [""]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  script:
+    - trivy image --severity CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE:$TAG"
+
+sbom:
+  stage: security
+  image:
+    name: anchore/syft:latest
+    entrypoint: [""]
+  variables:
+    SYFT_REGISTRY_AUTH_USERNAME: $CI_REGISTRY_USER
+    SYFT_REGISTRY_AUTH_PASSWORD: $CI_REGISTRY_PASSWORD
+  script:
+    - /syft "registry:$IMAGE:$TAG" -o cyclonedx-json=gl-sbom-release-info.cdx.json
+  artifacts:
+    paths:
+      - gl-sbom-release-info.cdx.json
+    reports:
+      cyclonedx:
+        - gl-sbom-release-info.cdx.json
+
+sign-image:
+  # keyless signing with GitLab's OIDC token (gitlab.com + Sigstore public instance)
+  stage: security
+  image: alpine:3.20
+  needs: [build-image, sbom]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  before_script:
+    - apk add --no-cache cosign
+    - cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+  script:
+    - cosign sign --yes "$IMAGE:$TAG"
+    - cosign attest --yes --type cyclonedx --predicate gl-sbom-release-info.cdx.json "$IMAGE:$TAG"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+kind-e2e:
+  stage: e2e
+  extends: .docker
+  needs: [build-image]
+  before_script:
+    - apk add --no-cache bash curl git
+    - curl -sSLo /usr/local/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.24.0/kind-linux-amd64
+    - curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.30.4/bin/linux/amd64/kubectl"
+    - curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+    - chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+  script:
+    # the kind API server runs inside the dind service, so point kubeconfig at the "docker" host
+    - kind create cluster --name e2e --config scripts/kind-dind.yaml
+    - |
+      sed -i -E 's#server: https://(0\.0\.0\.0|127\.0\.0\.1)#server: https://docker#' ~/.kube/config
+    - |
+      for v in e2e-v1 e2e-v2; do
+        docker build --build-arg APP_VERSION=$v --build-arg GIT_COMMIT="$CI_COMMIT_SHA" -t release-info:$v .
+        kind load docker-image release-info:$v --name e2e
+      done
+    - bash scripts/e2e-test.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+promote-dev:
+  # GitOps: commit the new tag; Argo CD picks it up. Needs a project access token with
+  # write_repository scope stored as the masked variable GITOPS_TOKEN.
+  stage: promote
+  image: alpine:3.20
+  needs: [kind-e2e, container-scan, sign-image]
+  resource_group: promote-dev
+  before_script:
+    - apk add --no-cache git
+  script:
+    - |
+      sed -i -E "s#^( *newTag: ).*#\1${TAG}#" k8s/overlays/dev/kustomization.yaml
+    - sed -i "s#ghcr.io/sonubepop/k8s-gitops-deploy#${IMAGE}#" k8s/overlays/dev/kustomization.yaml
+    - git config user.name "gitlab-ci" && git config user.email "gitlab-ci@${CI_SERVER_HOST}"
+    - git commit -am "deploy(dev) release-info ${TAG} [skip ci]" || exit 0
+    - git push "https://oauth2:${GITOPS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $GITOPS_TOKEN

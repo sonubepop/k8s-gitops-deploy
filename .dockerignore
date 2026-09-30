@@ -1,0 +1,11 @@
+.git
+.github
+tests
+k8s
+argocd
+monitoring
+docs
+scripts
+**/__pycache__
+.pytest_cache
+.ruff_cache
