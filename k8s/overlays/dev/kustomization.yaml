@@ -15,4 +15,4 @@ configMapGenerator:
 # The CI pipeline updates this tag after every successful build on main (GitOps promotion).
 images:
   - name: ghcr.io/sonubepop/k8s-gitops-deploy
-    newTag: latest
+    newTag: 16688d1
